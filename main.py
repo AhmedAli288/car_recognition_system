@@ -1,11 +1,15 @@
 # main.py
+
 import time
+from datetime import datetime
+
 import config
 from api.plate_recognizer import PlateRecognizerAPI
 from api.drive_handler import DriveHandler
 from storage.firebase_manager import FirebaseManager
 from storage.models import VehicleDetection
 from firebase_admin import firestore
+
 
 def run_system():
     drive = DriveHandler()
@@ -17,25 +21,37 @@ def run_system():
     while True:
         try:
             files = drive.get_new_files()
-            
+
             for f in files:
-                file_id = f['id']
-                file_name = f['name']
+                file_id = f.get('id')
+                file_name = f.get('name')
+
+                if not file_id:
+                    continue
 
                 if firebase.check_if_processed(file_id):
                     continue
 
                 print(f"📸 Processing: {file_name}")
 
+                # 🔥 START TIMESTAMP (IMPORTANT)
+                process_start_time = datetime.utcnow()
+
                 try:
-                    # 1. DOWNLOAD & ANALYZE
+                    # =========================
+                    # 1. DOWNLOAD + API CALL
+                    # =========================
                     img_bytes = drive.download_image(file_id)
-                    time.sleep(config.API_RATE_LIMIT_DELAY) # Rate limit protection
+
+                    time.sleep(config.API_RATE_LIMIT_DELAY)
+
                     api_result = api.call_api(img_bytes)
 
-                    # 2. SEARCH ALL RESULTS FOR BEST MMC
+                    # =========================
+                    # 2. FIND BEST MMC RESULT
+                    # =========================
                     all_results = api_result.get("results", [])
-                    
+
                     best_vehicle_hit = None
                     highest_mmc_score = -1.0
 
@@ -43,52 +59,76 @@ def run_system():
                         v_obj = res.get("vehicle")
                         if not v_obj:
                             continue
-                        
+
                         v_props = v_obj.get("props", {})
                         mm_candidates = v_props.get("make_model", [])
-                        
-                        if mm_candidates:
-                            # Sort candidates by score descending
-                            sorted_mm = sorted(mm_candidates, key=lambda x: x.get("score", 0), reverse=True)
-                            top_guess = sorted_mm[0]
-                            current_score = top_guess.get("score", 0.0)
 
-                            # If this vehicle result has a better MMC score than previous ones
+                        if mm_candidates:
+                            sorted_mm = sorted(
+                                mm_candidates,
+                                key=lambda x: x.get("score", 0),
+                                reverse=True
+                            )
+
+                            top_guess = sorted_mm[0]
+                            current_score = float(top_guess.get("score", 0.0))
+
                             if current_score > highest_mmc_score:
                                 highest_mmc_score = current_score
-                                # We store the whole result + the top guess for extraction
                                 best_vehicle_hit = {
                                     "full_res": res,
                                     "v_props": v_props,
                                     "best_mm": top_guess
                                 }
 
-                    # 3. EXTRACTION (Only if a vehicle was actually found)
+                    # =========================
+                    # 3. EXTRACTION
+                    # =========================
                     if best_vehicle_hit:
                         hit = best_vehicle_hit
                         props = hit["v_props"]
                         best_mm = hit["best_mm"]
-                        
-                        # Safe Extraction for Year (Stored as Integer)
+
+                        # YEAR (SAFE)
                         year_range = props.get("year", {}).get("year_range", [0, 0])
                         if not isinstance(year_range, (list, tuple)) or len(year_range) < 2:
                             year_range = [0, 0]
-                        
-                        # Safe Extraction for Color/Orientation
-                        colors = props.get("color", [])
-                        orients = props.get("orientation", [])
-                        
+
+                        # COLOR (SORT BY SCORE)
+                        colors = sorted(
+                            props.get("color", []),
+                            key=lambda x: x.get("score", 0),
+                            reverse=True
+                        )
                         best_color = colors[0].get("value", "Unknown") if colors else "Unknown"
+
+                        # ORIENTATION (SORT BY SCORE)
+                        orients = sorted(
+                            props.get("orientation", []),
+                            key=lambda x: x.get("score", 0),
+                            reverse=True
+                        )
                         best_orient = orients[0].get("value", "Unknown") if orients else "Unknown"
 
-                        # Storage & Privacy
+                        # =========================
+                        # 4. STORAGE
+                        # =========================
                         secure_url = firebase.upload_and_get_url(img_bytes, file_name)
-                        
-                        # GDPR: Redact plates in the full raw response before saving
-                        for r in all_results:
-                            if "plate" in r: r["plate"] = "REDACTED"
 
-                        # 4. MAP TO SCHEMA
+                        # 🔒 GDPR: redact plates
+                        for r in all_results:
+                            if "plate" in r:
+                                r["plate"] = "REDACTED"
+
+                        # ⏱ END TIME + DURATION
+                        process_end_time = datetime.utcnow()
+                        processing_duration = (
+                            process_end_time - process_start_time
+                        ).total_seconds()
+
+                        # =========================
+                        # 5. MAP TO SCHEMA
+                        # =========================
                         car_data = VehicleDetection(
                             make=best_mm.get("make", "Unknown"),
                             model=best_mm.get("model", "Unknown"),
@@ -99,22 +139,35 @@ def run_system():
                             confidence_score=float(highest_mmc_score),
                             image_url=secure_url,
                             drive_file_id=file_id,
+
+                            # 🔥 TIMESTAMPS
+                            process_start_time=process_start_time,
+                            process_duration_sec=processing_duration,
                             processed_at=firestore.SERVER_TIMESTAMP,
+
+                            # RAW RESPONSE
                             full_api_response=api_result
                         )
-                        
+
                         firebase.save_detection(file_id, car_data)
-                        print(f"✅ MMC SUCCESS: {car_data.make} {car_data.model} ({car_data.confidence_score})")
+
+                        print(
+                            f"✅ MMC SUCCESS: {car_data.make} {car_data.model} "
+                            f"({car_data.confidence_score}) | "
+                            f"⏱ {processing_duration:.2f}s"
+                        )
 
                     else:
-                        # TRULY NO VEHICLE FOUND IN ANY RESULT OBJECT
                         firebase.mark_as_processed(file_id, status="no_vehicle_found")
-                        print(f"⚠️ No MMC data found in {file_name}. Logged as processed.")
+                        print(f"⚠️ No MMC data found in {file_name}")
 
                 except Exception as file_error:
                     print(f"❌ Error processing {file_name}: {file_error}")
-                    firebase.mark_as_processed(file_id, status=f"error: {str(file_error)[:50]}")
-                    continue 
+                    firebase.mark_as_processed(
+                        file_id,
+                        status=f"error: {str(file_error)[:50]}"
+                    )
+                    continue
 
             print(f"Zzz... Sleeping {config.CHECK_INTERVAL}s")
             time.sleep(config.CHECK_INTERVAL)
@@ -122,6 +175,7 @@ def run_system():
         except Exception as global_error:
             print(f"❌ Global Error: {global_error}")
             time.sleep(10)
+
 
 if __name__ == "__main__":
     run_system()
