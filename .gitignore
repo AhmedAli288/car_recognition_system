@@ -1,0 +1,8 @@
+# Security: Do NOT upload these files
+.env
+keys/*.json
+
+# Python Environment
+venv/
+__pycache__/
+*.pyc
